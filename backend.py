@@ -36,6 +36,7 @@ def get_database_url():
             "Database Url is Missing"
         )
     
+    database_url = database_url.rstrip("/")
     if "sslmode" not in database_url:
         separator = "&" if "?" in database_url else "?"
         database_url = f"{database_url}{separator}sslmode=require"
@@ -48,90 +49,90 @@ def get_database_url():
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not GROQ_API_KEY:
-    raise ValueError ( "groq api key is missing")
+    raise ValueError("groq api key is missing")
 
 # LLM 
 llm = ChatGroq(
-     model="llama-3.3-70b-versatile",
-     api_key=GROQ_API_KEY
+    model="openai/gpt-oss-120b",
+    api_key=GROQ_API_KEY
 )
 
 
-#State
+# State
 
-class TravelSate(TypedDict):
-    messages : Annotated[list[AnyMessage],operator.add]
-    user_query : str
-    flight_results : str
-    hotel_results : str
-    itinerary : str
-    llm_calls ; int
+class TravelState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
+    user_query: str
+    flight_results: str
+    hotel_results: str
+    itinerary: str
+    llm_calls: int
 
 
 # flight agent
-def flight_agent(state : TravelSate):
+def flight_agent(state: TravelState):
     query = state["user_query"]
     flight_data = search_flights(query)
 
     return {
-        "flight_result":flight_data,
-        "message":[
+        "flight_results": flight_data,
+        "messages": [
             AIMessage(content="Flight result fetched")
-
         ],
-        "llm_calls":State.get("llm_calls",0) + 1
+        "llm_calls": state.get("llm_calls", 0) + 1
     }
-#hotel agent
-def Hotel_agent(state:TravelSate):
+
+# hotel agent
+def Hotel_agent(state: TravelState):
     query = f"Best hotels for {state['user_query']}"
     Hotel_results = tavily_search(query)
 
     return {
         "hotel_results": Hotel_results,
-        "message":[
+        "messages": [
             AIMessage(content="Hotel informations fetched")
         ],
-        "llm_calls" : state.get("llm_calls",0)+1
+        "llm_calls": state.get("llm_calls", 0) + 1
     }
 
-#itineray agent 
+# itinerary agent 
 
-def itinerary_agent(state:TravelSate):
-    promot = f"""
+def itinerary_agent(state: TravelState):
+    prompt = f"""
         create a complete travel itinerary.
 
         User Query:
             {state['user_query']}
         flight Query :
-            {state['flights_results']}
+            {state['flight_results']}
         Hotel Result:
             {state['hotel_results']}
         Make the itinery practical , buget-aware, and easy to follow
         """
     res = llm.invoke([
         SystemMessage(content="You are an expert traveller Planner"),
-        HumanMessage(content=promot)
+        HumanMessage(content=prompt)
     ])
 
     return {
-        "itinerary" : res.content,
-        "message" : [res],
-        "llm_call" : state.get("llm_calls",0)+1
+        "itinerary": res.content,
+        "messages": [res],
+        "llm_calls": state.get("llm_calls", 0) + 1
     }
 
 # final agent
 
-def final_agent(state: TravelSate):
-    final_promot = f"""
+def final_agent(state: TravelState):
+    final_prompt = f"""
     Generate the final travel response for the user.
         User Request:
             {state['user_query']}
         flights :
-            {state['flights_results']}
+            {state['flight_results']}
         Hotel Result:
             {state['hotel_results']}
         Itinerary:
-            { state['itinerary']}
+            {state['itinerary']}
     Format the final answer beautifully using these sections:
 
 1. Trip Summary
@@ -160,20 +161,20 @@ Important:
 
 # Graph build
 
-graph = StateGraph(TravelSate)
+graph = StateGraph(TravelState)
 
-graph.add_node("flight_agent",flight_agent)
-graph.add_node("hotel_agent",Hotel_agent)
-graph.add_node("itinerary_agent",itinerary_agent)
-graph.add_node("final_agent",final_agent)
+graph.add_node("flight_agent", flight_agent)
+graph.add_node("hotel_agent", Hotel_agent)
+graph.add_node("itinerary_agent", itinerary_agent)
+graph.add_node("final_agent", final_agent)
 
-graph.add_edge(START,"flight_agent")
-graph.add_edge("flight_agent","hotel_agent")
-graph.add_edge("hotel_agent","itinerary_agent")
-graph.add_edge("itinerary_agent","final_agent")
-graph.add_edge("final_agent",END)
+graph.add_edge(START, "flight_agent")
+graph.add_edge("flight_agent", "hotel_agent")
+graph.add_edge("hotel_agent", "itinerary_agent")
+graph.add_edge("itinerary_agent", "final_agent")
+graph.add_edge("final_agent", END)
 
-#database check point
+# database checkpoint
 Database_url = get_database_url()
 
 con_db = psycopg.connect(
@@ -181,3 +182,44 @@ con_db = psycopg.connect(
     autocommit=True,
     row_factory=dict_row
 )
+
+checkpointer = PostgresSaver(con_db)
+checkpointer.setup()
+
+travel_graph = graph.compile(checkpointer=checkpointer)
+
+
+def run_travel_agent(user_input: str, thread_id: str | None = None):
+    if not thread_id:
+        thread_id = f"user_{uuid.uuid4().hex}"
+
+    config = {
+        "configurable": {
+            "thread_id": thread_id
+        }
+    }
+
+    result = travel_graph.invoke(
+        {
+            "messages": [
+                HumanMessage(content=user_input)
+            ],
+            "user_query": user_input,
+            "flight_results": "",
+            "hotel_results": "",
+            "itinerary": "",
+            "llm_calls": 0
+        },
+        config=config
+    )
+
+    final_answer = result["messages"][-1].content
+
+    return {
+        "thread_id": thread_id,
+        "answer": final_answer,
+        "flight_results": result.get("flight_results", ""),
+        "hotel_results": result.get("hotel_results", ""),
+        "itinerary": result.get("itinerary", ""),
+        "llm_calls": result.get("llm_calls", 0),
+    }
